@@ -38,6 +38,23 @@ limitations under the License.
     <a href="https://hf.co/course"><img src="https://raw.githubusercontent.com/huggingface/accelerate/main/docs/source/imgs/course_banner.png"></a>
 </h3>
 
+## Checkpoint security maintenance
+
+This fork preserves Accelerate 1.14 APIs with version `1.14.0+security.1`.
+It fixes GHSA-4j2p-28q2-5m79 by constraining checkpoint index paths, rejecting
+nonregular files before reading, and keeping opened file descriptors through
+weight loading. POSIX opens reject symlinks at every resolved path component.
+Windows validates the final path of the opened handle.
+
+Hugging Face snapshot index and shard symlinks remain supported when their
+targets stay inside the same repository's canonical `blobs` directory.
+Safetensors format detection uses the logical shard name. Platforms without
+descriptor paths load a private copy and detach CPU mappings before cleanup.
+
+The implementation extends upstream PR 4214
+(`a35af225361fe0097900680e850c84bae97340b7`) with descriptor pinning, validated
+HF cache links, index and unsharded-file checks, and platform regressions.
+
 ## Easy to integrate
 
 🤗 Accelerate was created for PyTorch users who like to write the training loop of PyTorch models but are reluctant to write and maintain the boilerplate code needed to use multi-GPUs/TPU/fp16.

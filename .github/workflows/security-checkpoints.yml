@@ -1,0 +1,39 @@
+name: Checkpoint security backport
+
+on:
+  push:
+    branches: [security/restricted-checkpoint-load]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkpoints:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - name: Prepare the pinned Torch 2.3 test environment
+        shell: bash
+        run: |
+          mkdir .security-test-env
+          cat > .security-test-env/pyproject.toml <<'TOML'
+          [project]
+          name = "checkpoint-security-tests"
+          version = "0.0.0"
+          requires-python = ">=3.11,<3.12"
+          dependencies = ["accelerate", "torch==2.3.0", "numpy==1.26.4", "huggingface-hub==0.23.2", "pytest>=8,<9", "parameterized", "pytest-subtests", "ruff==0.13.1"]
+          [tool.uv.sources]
+          accelerate = { path = "..", editable = true }
+          TOML
+          uv sync --project .security-test-env --python 3.11.15
+      - name: Checkpoint behavior and platform regressions
+        shell: bash
+        run: |
+          uv run --project .security-test-env --no-sync python -m pytest tests/test_checkpoint_security.py tests/test_modeling_utils.py -q
+          uv run --project .security-test-env --no-sync ruff check setup.py src/accelerate/__init__.py src/accelerate/utils/modeling.py src/accelerate/utils/checkpoint_security.py tests/test_checkpoint_security.py

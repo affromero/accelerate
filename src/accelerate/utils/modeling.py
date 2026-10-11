@@ -30,6 +30,7 @@ from torch import distributed as dist
 from torch import nn
 
 from ..state import AcceleratorState
+from .checkpoint_security import open_checkpoint_file, validate_checkpoint_name
 from .constants import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 from .dataclasses import AutocastKwargs, CustomDtype, DistributedType
 from .imports import (
@@ -1634,18 +1635,19 @@ def check_device_map(model: nn.Module, device_map: dict[str, Union[int, str, tor
         )
 
 
-def load_state_dict(checkpoint_file, device_map=None):
+def load_state_dict(checkpoint_file, device_map=None, *, filename=None):
     """
     Load a checkpoint from a given file. If the checkpoint is in the safetensors format and a device map is passed, the
     weights can be fast-loaded directly on the GPU.
 
     Args:
         checkpoint_file (`str`): The path to the checkpoint to load.
+        filename (`str`, *optional*): Logical filename used to identify the format when loading an opened file.
         device_map (`Dict[str, Union[int, str, torch.device]]`, *optional*):
             A map that specifies where each submodule should go. It doesn't need to be refined to each parameter/buffer
             name, once a given module name is inside, every submodule of it will be sent to the same device.
     """
-    if checkpoint_file.endswith(".safetensors"):
+    if (filename or checkpoint_file).endswith(".safetensors"):
         with safe_open(checkpoint_file, framework="pt") as f:
             metadata = f.metadata()
             weight_names = f.keys()
@@ -1727,6 +1729,28 @@ def load_state_dict(checkpoint_file, device_map=None):
             return tensors
     else:
         return torch.load(checkpoint_file, map_location=torch.device("cpu"), weights_only=True)
+
+
+def _load_checkpoint_state_dict(checkpoint_file, checkpoint_folder, device_map=None):
+    filename = os.path.relpath(checkpoint_file, checkpoint_folder).replace(os.sep, "/")
+    with open_checkpoint_file(checkpoint_folder, filename) as handle:
+        if not filename.endswith(".safetensors"):
+            return load_state_dict(handle, device_map=device_map, filename=filename)
+        descriptor_root = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+        descriptor_path = os.path.join(descriptor_root, str(handle.fileno()))
+        if os.path.exists(descriptor_path):
+            return load_state_dict(descriptor_path, device_map=device_map, filename=filename)
+        with tempfile.TemporaryDirectory() as directory:
+            copied_path = os.path.join(directory, "checkpoint.safetensors")
+            with open(copied_path, "wb") as copied:
+                shutil.copyfileobj(handle, copied)
+            mapped_state = load_state_dict(copied_path, device_map=device_map)
+            detached_state = {
+                name: tensor.clone() if tensor.device.type == "cpu" else tensor
+                for name, tensor in mapped_state.items()
+            }
+            del mapped_state
+            return detached_state
 
 
 def get_state_dict_offloaded_model(model: nn.Module):
@@ -1921,13 +1945,21 @@ def load_checkpoint_in_model(
             f"checkpoint, or a folder containing a sharded checkpoint or the whole state dict, but got {checkpoint}."
         )
 
+    checkpoint_folder = (
+        os.path.abspath(checkpoint) if os.path.isdir(checkpoint) else os.path.dirname(os.path.abspath(checkpoint))
+    )
     if index_filename is not None:
-        checkpoint_folder = os.path.split(index_filename)[0]
-        with open(index_filename) as f:
+        with open_checkpoint_file(checkpoint_folder, os.path.basename(index_filename)) as f:
             index = json.loads(f.read())
 
+        if not isinstance(index, dict):
+            raise ValueError("Checkpoint index must contain a weight mapping")
         if "weight_map" in index:
             index = index["weight_map"]
+        if not isinstance(index, dict) or not index:
+            raise ValueError("Checkpoint index must contain a nonempty weight mapping")
+        for filename in index.values():
+            validate_checkpoint_name(filename)
         checkpoint_files = sorted(list(set(index.values())))
         checkpoint_files = [os.path.join(checkpoint_folder, f) for f in checkpoint_files]
 
@@ -1955,7 +1987,7 @@ def load_checkpoint_in_model(
 
                 broadcast_from_rank0 &= is_torch_version(">=", "2.4.0")
                 loaded_checkpoint = (
-                    load_state_dict(checkpoint_file, device_map=device_map)
+                    _load_checkpoint_state_dict(checkpoint_file, checkpoint_folder, device_map=device_map)
                     if not broadcast_from_rank0 or dist.get_rank() == 0
                     else {}
                 )
@@ -1969,12 +2001,14 @@ def load_checkpoint_in_model(
                     ),
                 )
             else:
-                loaded_checkpoint = load_state_dict(checkpoint_file, device_map=device_map)
+                loaded_checkpoint = _load_checkpoint_state_dict(
+                    checkpoint_file, checkpoint_folder, device_map=device_map
+                )
                 model.load_state_dict(loaded_checkpoint, strict=strict)
 
             unexpected_keys.update(set(loaded_checkpoint.keys()) - model_keys)
         else:
-            loaded_checkpoint = load_state_dict(checkpoint_file, device_map=device_map)
+            loaded_checkpoint = _load_checkpoint_state_dict(checkpoint_file, checkpoint_folder, device_map=device_map)
 
             for param_name, param in loaded_checkpoint.items():
                 # skip SCB parameter (for 8-bit serialization)
