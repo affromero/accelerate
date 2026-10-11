@@ -527,13 +527,14 @@ class ModelingUtilsTester(unittest.TestCase):
         assert model.linear2.weight.device == torch.device(torch_device.replace("0", "1"))
 
     def test_load_checkpoint_in_model_dtype(self):
-        with tempfile.NamedTemporaryFile(suffix=".pt") as tmpfile:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = os.path.join(tmpdir, "model.pt")
             model = ModelSeveralDtypes()
-            torch.save(model.state_dict(), tmpfile.name)
+            torch.save(model.state_dict(), checkpoint)
 
             new_model = ModelSeveralDtypes()
             load_checkpoint_in_model(
-                new_model, tmpfile.name, offload_state_dict=True, dtype=torch.float16, device_map={"": "cpu"}
+                new_model, checkpoint, offload_state_dict=True, dtype=torch.float16, device_map={"": "cpu"}
             )
 
             assert new_model.int_param.dtype == torch.int64
@@ -545,18 +546,19 @@ class ModelingUtilsTester(unittest.TestCase):
 
         state_dict = model.state_dict()
         state_dict["foo"] = torch.rand(4, 5)
-        with tempfile.NamedTemporaryFile(suffix=".pt") as tmpfile:
-            torch.save(state_dict, tmpfile)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = os.path.join(tmpdir, "model.pt")
+            torch.save(state_dict, checkpoint)
 
             model = ModelForTest()
 
             with self.assertLogs() as cm:
-                load_checkpoint_in_model(model, tmpfile.name, device_map=device_map)
+                load_checkpoint_in_model(model, checkpoint, device_map=device_map)
 
                 self.assertTrue(any("were not used when" in out for out in cm.output))
 
             with self.assertRaises((ValueError, RuntimeError)):
-                load_checkpoint_in_model(model, tmpfile.name, device_map=device_map, strict=True)
+                load_checkpoint_in_model(model, checkpoint, device_map=device_map, strict=True)
 
     def test_clean_device_map(self):
         # Regroup everything if all is on the same device
